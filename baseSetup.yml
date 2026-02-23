@@ -1,0 +1,166 @@
+---
+- name: Home Server Base Setup
+  hosts: home_servers
+  gather_facts: no
+  become: yes
+  tasks:
+    - name: Install Python (For VM)
+      raw: apt update && apt install -y python3
+      changed_when: false
+
+    - name: Update System
+      apt: 
+        name: "*"
+        state: latest
+        update_cache: yes
+
+    - name: Set Timezone (Change as Needed)
+      timezone: 
+        name: Asia/Jakarta
+
+    - name: Install Basic Tools
+      apt: 
+        name: 
+          - htop
+          - curl
+          - wget
+          - git
+          - vim
+          - net-tools
+          - unzip
+          - software-properties-common
+          - apt-transport-https
+          - ca-certificates
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+    - name: Install SSH (If Not Installed)
+      apt:
+        name: openssh-server
+        state: present
+        update_cache: yes
+    
+    - name: Allow SSH + Active Firewall
+      ufw:
+        rule: allow
+        name: OpenSSH
+        state: enabled
+
+    - name: Install CasaOS + Docker
+      shell: curl -fsSL https://get.casaos.io | bash
+      args:
+        creates: /usr/bin/casaos
+
+    - name: Check if Tailscale is installed via Docker
+      shell: docker ps -a -q -f name=tailscale
+      register: tailscale_status
+      changed_when: false
+
+    - name: Install Tailscale via Docker (If Not Installed)
+      shell: |
+        docker run -d --name tailscale \
+        --restart=unless-stopped \
+        --network=host \
+        --cap-add=NET_ADMIN \
+        --cap-add=NET_RAW \
+        -v tailscale:/var/lib/tailscale \
+        -v /dev/net/tun:/dev/net/tun \
+        -e TS_AUTHKEY="{{ ts_key }}" \
+        tailscale/tailscale:latest
+      when: tailscale_status.stdout == ""
+
+    - name: Check if Cloudflare Tunnel is installed via Docker
+      shell: docker ps -a -q -f name=cloudflare
+      register: cloudflare_status
+      changed_when: false
+
+    - name: Install Cloudflare Tunnel
+      shell: |
+        docker run -d --name cloudflare \
+        --restart=unless-stopped \
+        --network=host \
+        -e TUNNEL_TOKEN="{{ cf_token }}" \
+        cloudflare/cloudflared:latest tunnel --no-autoupdate run
+      when: cloudflare_status.stdout == ""
+
+    - name: Check if Monitoring is installed via Docker
+      shell: docker ps -a -q -f name=prometheus
+      register: monitoring_status
+      changed_when: false
+
+    - name: Install Monitoring Tools (Prometheus + Grafana)
+      block:
+        - name: Create Monitoring Directory
+          file:
+            path: /opt/monitoring
+            state: directory
+            mode: '0755'
+
+        - name: Create Monitoring Docker-Compose file
+          copy:
+            dest: /opt/monitoring/docker-compose.yml
+            content: |
+              services:
+                node_exporter:
+                  image: quay.io/prometheus/node-exporter:latest
+                  container_name: node_exporter
+                  command:
+                    - '--path.rootfs=/host'
+                  network_mode: host
+                  pid: host
+                  restart: unless-stopped
+                  volumes:
+                    - '/:/host:ro,rslave'
+
+                prometheus:
+                  image: prom/prometheus:latest
+                  container_name: prometheus
+                  restart: unless-stopped
+                  ports:
+                    - "9090:9090"
+                  volumes:
+                    - ./prometheus.yml:/etc/prometheus/prometheus.yml
+                    - prometheus_data:/prometheus
+                  command:
+                    - '--config.file=/etc/prometheus/prometheus.yml'
+                    - '--storage.tsdb.path=/prometheus'
+
+                grafana:
+                  image: grafana/grafana:latest
+                  container_name: grafana
+                  restart: unless-stopped
+                  ports:
+                    - "3101:3000"
+                  environment:
+                    - GF_SECURITY_ADMIN_USER={{ grafana_user }}
+                    - GF_SECURITY_ADMIN_PASSWORD={{ grafana_pass }} 
+                  volumes:
+                    - grafana_data:/var/lib/grafana
+
+              volumes:
+                prometheus_data:
+                grafana_data:
+
+        - name: Create Prometheus Config File (Change target IP as needed)
+          copy:
+            dest: /opt/monitoring/prometheus.yml
+            content: |
+              global:
+                scrape_interval: 15s
+
+              scrape_configs:
+                - job_name: 'prometheus'
+                  static_configs:
+                    - targets: ['localhost:9090']
+
+                - job_name: 'node_exporter'
+                  static_configs:
+                    - targets: ['localhost:9100']
+
+        - name: Start Monitoring Docker
+          shell: docker compose up -d
+          args:
+            chdir: /opt/monitoring
+      when: monitoring_status.stdout == ""
